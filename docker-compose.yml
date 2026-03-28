@@ -1,0 +1,18 @@
+services:
+  # 本番サーバー (http://localhost:3000)
+  app:
+    build:
+      context: .
+      target: production
+    ports:
+      - "3000:3000"
+    volumes:
+      - /output:/output
+    restart: unless-stopped
+
+  # ユニットテスト
+  test:
+    build:
+      context: .
+      target: test
+    profiles: [test]
