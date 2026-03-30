@@ -77,6 +77,7 @@ export default function App() {
           <RecoveryComplete
             result={recovery.recoveryResult}
             onReset={recovery.reset}
+            onBackToFiles={recovery.backToFiles}
           />
         )}
       </main>

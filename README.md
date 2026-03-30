@@ -198,7 +198,59 @@ APP_HDDSalvager2026/
 
 ---
 
-## 5. 開発ロードマップ
+## 5. 使用方法
+
+### 5.1 Docker で起動（推奨）
+
+```bash
+# イメージをビルド & 起動
+docker compose up -d
+
+# ブラウザでアクセス
+# http://localhost:3000
+
+# ログを確認
+docker compose logs -f app
+
+# 停止
+docker compose down
+```
+
+**注意事項:**
+- RAWディスクアクセスのため `privileged: true` で実行されます
+- Linux環境で `/dev` をマウントしてデバイスにアクセスします
+- 復元されたファイルは `./output` ディレクトリに保存されます
+
+### 5.2 開発モード
+
+```bash
+# 依存関係をインストール
+npm install
+
+# 開発サーバーを起動（クライアント: Vite, サーバー: tsx watch）
+npm run dev
+
+# ブラウザでアクセス
+# クライアント: http://localhost:5173
+# サーバーAPI: http://localhost:3000
+```
+
+### 5.3 本番ビルド
+
+```bash
+# ビルド
+npm run build
+
+# 起動
+npm start
+
+# ブラウザでアクセス
+# http://localhost:3000
+```
+
+---
+
+## 6. 開発ロードマップ
 
 ### Phase 1: 基盤構築
 - [ ] Electron + React + TypeScript プロジェクトセットアップ
@@ -230,7 +282,7 @@ APP_HDDSalvager2026/
 
 ---
 
-## 6. 注意事項
+## 7. 注意事項
 
 - **管理者権限**: rawディスクアクセス (`\\.\PhysicalDriveN`) にはWindows管理者権限が必須
 - **読み取り専用**: アプリはSDカードに対して一切の書き込みを行わない設計とする

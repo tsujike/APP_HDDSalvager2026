@@ -1,29 +1,68 @@
-import { execSync } from 'child_process'
+import { execSync, execFileSync } from 'child_process'
 import * as fs from 'fs'
-import type { DriveInfo } from './types'
+import * as path from 'path'
+import { fileURLToPath } from 'url'
+import type { DriveInfo } from './types.js'
 
 /**
- * Windows rawディスク読み取りモジュール
+ * rawディスク読み取りモジュール
  *
- * \\.\PhysicalDriveN を直接openしてセクタ単位で読み取る。
- * 管理者権限が必要。
+ * Windows: Node.jsのfs.readSyncはデバイスパスに非対応のため、
+ *          disk-reader.exe (Win32 CreateFile/ReadFile) を単発実行して読み取る。
+ *          バイナリデータを直接stdoutに返すため高速。
+ * Linux:   fs.openSync/readSync で直接アクセス。
  */
 
 const SECTOR_SIZE = 512
 
+/** 仮想fd → ドライブパス (Windows用) */
+const winDrives = new Map<number, string>()
+let nextFd = 10000
+
+/** disk-reader.exe のパスを解決 */
+let diskReaderExePath: string | null = null
+function getDiskReaderExe(): string {
+  if (diskReaderExePath) return diskReaderExePath
+  const __dirname = path.dirname(fileURLToPath(import.meta.url))
+  const candidates = [
+    path.resolve(__dirname, '../../../../tools/disk-reader.exe'),
+    path.resolve(__dirname, '../../../tools/disk-reader.exe'),
+    path.resolve(__dirname, '../../tools/disk-reader.exe'),
+    path.resolve(process.cwd(), 'tools/disk-reader.exe'),
+  ]
+  for (const p of candidates) {
+    if (fs.existsSync(p)) { diskReaderExePath = p; return p }
+  }
+  throw new Error('disk-reader.exe が見つかりません。tools/ ディレクトリを確認してください。')
+}
+
 /**
- * 物理ドライブをオープンし、セクタ読み取り用のfdを返す。
- * Node.js の fs.openSync は \\.\PhysicalDriveN に対してもread可能。
+ * 物理ドライブをオープンし、読み取り用ハンドル(fd)を返す。
  */
 export function openDrive(physicalDrive: string): number {
+  if (process.platform === 'win32') {
+    // テスト読み取りで開けるか確認
+    try {
+      winReadBytes(physicalDrive, 0, SECTOR_SIZE)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('error 5') || msg.includes('Access')) {
+        throw new Error(`管理者権限が必要です。アプリを管理者として実行してください。`)
+      }
+      throw new Error(`ドライブを開けません: ${physicalDrive}\n詳細: ${msg}`)
+    }
+    const fd = nextFd++
+    winDrives.set(fd, physicalDrive)
+    return fd
+  }
+
+  // Linux
   try {
     return fs.openSync(physicalDrive, 'r')
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
     if (message.includes('EACCES') || message.includes('EPERM')) {
-      throw new Error(
-        `管理者権限が必要です。アプリを管理者として実行してください。\n詳細: ${message}`
-      )
+      throw new Error(`管理者権限が必要です。\n詳細: ${message}`)
     }
     throw new Error(`ドライブを開けません: ${physicalDrive}\n詳細: ${message}`)
   }
@@ -31,19 +70,30 @@ export function openDrive(physicalDrive: string): number {
 
 /**
  * 指定オフセットから指定バイト数を読み取る。
- * 読み取りはセクタ境界にアラインされる。
  */
 export function readSectors(
   fd: number,
   offsetBytes: number,
   lengthBytes: number
 ): Buffer {
-  const buf = Buffer.alloc(lengthBytes)
-  const bytesRead = fs.readSync(fd, buf, 0, lengthBytes, offsetBytes)
-  if (bytesRead < lengthBytes) {
-    return buf.subarray(0, bytesRead)
+  if (lengthBytes <= 0) return Buffer.alloc(0)
+
+  const drivePath = winDrives.get(fd)
+  if (drivePath) {
+    return winReadBytes(drivePath, offsetBytes, lengthBytes)
   }
-  return buf
+
+  // Linux: セクタ境界にアラインして読み取り
+  const alignedOffset = Math.floor(offsetBytes / SECTOR_SIZE) * SECTOR_SIZE
+  const headPadding = offsetBytes - alignedOffset
+  const alignedLength = Math.ceil((headPadding + lengthBytes) / SECTOR_SIZE) * SECTOR_SIZE
+
+  const buf = Buffer.alloc(alignedLength)
+  const bytesRead = fs.readSync(fd, buf, 0, alignedLength, alignedOffset)
+
+  const end = Math.min(headPadding + lengthBytes, bytesRead)
+  if (end <= headPadding) return Buffer.alloc(0)
+  return buf.subarray(headPadding, end)
 }
 
 /**
@@ -55,46 +105,87 @@ export function readSectorRange(
   sectorCount: number,
   bytesPerSector: number = SECTOR_SIZE
 ): Buffer {
-  const offset = startSector * bytesPerSector
-  const length = sectorCount * bytesPerSector
-  return readSectors(fd, offset, length)
+  return readSectors(fd, startSector * bytesPerSector, sectorCount * bytesPerSector)
 }
 
 /**
  * ドライブを閉じる。
  */
 export function closeDrive(fd: number): void {
+  if (winDrives.has(fd)) {
+    winDrives.delete(fd)
+    return
+  }
   fs.closeSync(fd)
 }
 
 /**
+ * Windows: disk-reader.exe を単発実行してバイナリデータを取得。
+ * EXEはセクタアラインメントとWin32 API呼び出しを内部で処理する。
+ */
+function winReadBytes(drivePath: string, offset: number, length: number): Buffer {
+  const exe = getDiskReaderExe()
+  try {
+    const result = execFileSync(exe, [drivePath, offset.toString(), length.toString()], {
+      encoding: 'buffer',
+      timeout: 60000,
+      maxBuffer: 50 * 1024 * 1024
+    })
+    return result
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    throw new Error(`ディスク読み取りエラー (offset=${offset}): ${msg}`)
+  }
+}
+
+/**
  * 接続されたリムーバブルドライブの一覧を取得する。
- * WMICを使用してUSB接続のリムーバブルディスクを列挙。
+ * Windows: WMI/PowerShell を使用
+ * Linux: lsblk を使用
  */
 export function listRemovableDrives(): DriveInfo[] {
-  try {
-    // PowerShellでリムーバブルドライブを列挙
-    const psScript = `
-      Get-WmiObject Win32_DiskDrive | Where-Object { $_.MediaType -like '*removable*' -or $_.MediaType -like '*external*' -or $_.InterfaceType -eq 'USB' } | ForEach-Object {
-        $disk = $_
-        $partitions = Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskDrive.DeviceID='$($disk.DeviceID.Replace("\\","\\\\"))'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
-        foreach ($part in $partitions) {
-          $logicals = Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($part.DeviceID)'} WHERE AssocClass=Win32_LogicalDiskToPartition"
-          foreach ($logical in $logicals) {
-            [PSCustomObject]@{
-              Letter = $logical.DeviceID
-              Label = $logical.VolumeName
-              Size = $logical.Size
-              FileSystem = $logical.FileSystem
-              PhysicalDrive = $disk.DeviceID
-              DeviceName = $disk.Model
-            } | ConvertTo-Json -Compress
-          }
-        }
-      }
-    `.trim()
+  if (process.platform === 'win32') {
+    return listRemovableDrivesWindows()
+  } else {
+    return listRemovableDrivesLinux()
+  }
+}
 
-    const output = execSync(`powershell -NoProfile -Command "${psScript.replace(/"/g, '\\"')}"`, {
+/**
+ * Windows: PowerShellでリムーバブルドライブを列挙。
+ * Get-Disk + Get-Partition + Get-Volume を使用（WMI ASSOCIATORSのエスケープ問題を回避）。
+ * BusType判定: USB, SD, MMC は確実。SCSI/RAID は FriendlyName に
+ * 'Card Reader' 等が含まれる場合のみ対象（内蔵カードリーダー対応）。
+ */
+function listRemovableDrivesWindows(): DriveInfo[] {
+  try {
+    const psScript = `
+Get-Disk | Where-Object {
+  $_.BusType -eq 'USB' -or
+  $_.BusType -eq 'SD' -or
+  $_.BusType -eq 'MMC' -or
+  ($_.BusType -eq 'SCSI' -and $_.FriendlyName -match 'Card Reader|SD|MMC|SDXC|SDHC')
+} | ForEach-Object {
+  $disk = $_
+  Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+    Where-Object { $_.DriveLetter } |
+    ForEach-Object {
+      $vol = Get-Volume -DriveLetter $_.DriveLetter -ErrorAction SilentlyContinue
+      if ($vol) {
+        [PSCustomObject]@{
+          Letter       = $_.DriveLetter + ':'
+          Label        = $vol.FileSystemLabel
+          Size         = $vol.Size
+          FileSystem   = $vol.FileSystem
+          PhysicalDrive = '\\\\.\\' + $_.DriveLetter + ':'
+          DeviceName   = $disk.FriendlyName
+        } | ConvertTo-Json -Compress
+      }
+    }
+}
+`
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64')
+    const output = execSync(`powershell -NoProfile -EncodedCommand ${encoded}`, {
       encoding: 'utf-8',
       timeout: 15000
     }).trim()
@@ -126,26 +217,96 @@ export function listRemovableDrives(): DriveInfo[] {
 }
 
 /**
- * ドライブレターから物理ドライブパスを取得する。
+ * Linux: lsblk でリムーバブルドライブを列挙
  */
-export function getPhysicalDrivePath(driveLetter: string): string {
+function listRemovableDrivesLinux(): DriveInfo[] {
   try {
-    const letter = driveLetter.replace(':', '').replace('\\', '')
-    const psScript = `
-      $part = Get-WmiObject -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='${letter}:'} WHERE AssocClass=Win32_LogicalDiskToPartition"
-      if ($part) {
-        $disk = Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($part.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
-        if ($disk) { $disk.DeviceID }
-      }
-    `.trim()
-    const output = execSync(`powershell -NoProfile -Command "${psScript.replace(/"/g, '\\"')}"`, {
+    // lsblk -J -o NAME,SIZE,FSTYPE,LABEL,TYPE,RM,MOUNTPOINT でJSON形式出力
+    const output = execSync('lsblk -J -b -o NAME,SIZE,FSTYPE,LABEL,TYPE,RM,MOUNTPOINT', {
       encoding: 'utf-8',
       timeout: 10000
     }).trim()
-    return output || `\\\\.\\${letter}:`
+
+    if (!output) return []
+
+    const parsed = JSON.parse(output)
+    const drives: DriveInfo[] = []
+
+    // blockdevices の中からリムーバブル(RM=1)かつパーティションを持つものを抽出
+    for (const device of parsed.blockdevices || []) {
+      // RM=1 (removable) のディスクをチェック
+      if (device.rm !== '1' && device.rm !== 1) continue
+      if (device.type !== 'disk') continue
+
+      // パーティションを走査
+      for (const part of device.children || []) {
+        if (part.type !== 'part') continue
+
+        const mountpoint = part.mountpoint || ''
+        const letter = mountpoint || `/dev/${part.name}`
+        const label = part.label || ''
+        const size = parseInt(part.size) || 0
+        const fstype = part.fstype || ''
+
+        drives.push({
+          letter,
+          label,
+          totalSize: size,
+          fileSystem: detectFileSystem(fstype),
+          physicalDrive: `/dev/${device.name}`,
+          deviceName: device.name || ''
+        })
+      }
+
+      // パーティションがない場合はディスク全体
+      if (!device.children || device.children.length === 0) {
+        drives.push({
+          letter: `/dev/${device.name}`,
+          label: device.label || '',
+          totalSize: parseInt(device.size) || 0,
+          fileSystem: detectFileSystem(device.fstype),
+          physicalDrive: `/dev/${device.name}`,
+          deviceName: device.name || ''
+        })
+      }
+    }
+
+    return drives
   } catch {
-    const letter = driveLetter.replace(':', '').replace('\\', '')
-    return `\\\\.\\${letter}:`
+    return []
+  }
+}
+
+/**
+ * ドライブレターから物理ドライブパスを取得する。
+ * Windows: WMI経由で物理ドライブを取得
+ * Linux: パーティション名から親ディスクを取得
+ */
+export function getPhysicalDrivePath(driveLetter: string): string {
+  if (process.platform === 'win32') {
+    try {
+      const letter = driveLetter.replace(':', '').replace('\\', '')
+      const psScript = `
+$part = Get-WmiObject -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='${letter}:'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+if ($part) {
+  $disk = Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($part.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
+  if ($disk) { $disk.DeviceID }
+}
+`
+      const encoded = Buffer.from(psScript, 'utf16le').toString('base64')
+      const output = execSync(`powershell -NoProfile -EncodedCommand ${encoded}`, {
+        encoding: 'utf-8',
+        timeout: 10000
+      }).trim()
+      return output || `\\\\.\\${letter}:`
+    } catch {
+      const letter = driveLetter.replace(':', '').replace('\\', '')
+      return `\\\\.\\${letter}:`
+    }
+  } else {
+    // Linux: /dev/sda1 → /dev/sda のような変換
+    // パーティション番号を除去
+    return driveLetter.replace(/\d+$/, '')
   }
 }
 

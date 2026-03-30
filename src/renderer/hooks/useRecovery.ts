@@ -31,9 +31,14 @@ export function useRecovery() {
   const [enableCarving, setEnableCarving] = useState(true)
 
   const eventSourceRef = useRef<EventSource | null>(null)
+  const sessionIdRef = useRef<string | null>(null)
 
   useEffect(() => {
     refreshDrives()
+    // デフォルト設定をサーバーから取得
+    fetch(`${API}/config/defaults`).then(r => r.json()).then(data => {
+      if (data.outputDir) setOutputDir(data.outputDir)
+    }).catch(() => {})
     return () => {
       eventSourceRef.current?.close()
     }
@@ -55,15 +60,8 @@ export function useRecovery() {
     setStep('scanning')
     setScanProgress(null)
 
-    // SSEで進捗を受信
-    const es = new EventSource(`${API}/scan/progress`)
-    eventSourceRef.current = es
-    es.onmessage = (event) => {
-      const progress: ScanProgress = JSON.parse(event.data)
-      setScanProgress(progress)
-    }
-
     try {
+      // 1. スキャンをバックグラウンドで開始（即座にsessionId返却）
       const res = await fetch(`${API}/scan/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -74,20 +72,61 @@ export function useRecovery() {
         })
       })
 
-      es.close()
-      eventSourceRef.current = null
-
       if (!res.ok) {
         const err = await res.json()
         throw new Error(err.error || 'スキャンに失敗しました')
       }
 
-      const files: RecoveredFile[] = await res.json()
+      const { sessionId } = await res.json()
+      sessionIdRef.current = sessionId
+
+      // 2. SSEで進捗をリアルタイム受信
+      const files = await new Promise<RecoveredFile[]>((resolve, reject) => {
+        const es = new EventSource(`${API}/scan/progress?sessionId=${sessionId}`)
+        eventSourceRef.current = es
+
+        const fetchResult = async (retries = 3): Promise<RecoveredFile[]> => {
+          for (let i = 0; i < retries; i++) {
+            const r = await fetch(`${API}/scan/result?sessionId=${sessionId}`)
+            if (r.status === 202) {
+              // まだ結果が準備できていない → 少し待ってリトライ
+              await new Promise(res => setTimeout(res, 500))
+              continue
+            }
+            if (!r.ok) {
+              const err = await r.json()
+              throw new Error(err.error || 'スキャン結果の取得に失敗しました')
+            }
+            const data = await r.json()
+            return data.files ?? []
+          }
+          throw new Error('スキャン結果の取得がタイムアウトしました')
+        }
+
+        es.onmessage = (event) => {
+          const progress: ScanProgress = JSON.parse(event.data)
+          setScanProgress(progress)
+
+          if (progress.phase === 'complete') {
+            es.close()
+            eventSourceRef.current = null
+            fetchResult().then(resolve).catch(reject)
+          }
+        }
+
+        es.onerror = () => {
+          es.close()
+          eventSourceRef.current = null
+          reject(new Error('スキャン進捗の接続が切れました'))
+        }
+      })
+
       setRecoveredFiles(files)
       setSelectedFiles(new Set(files.map(f => f.id)))
       setStep('file-list')
     } catch (err: unknown) {
-      es.close()
+      eventSourceRef.current?.close()
+      eventSourceRef.current = null
       setError(err instanceof Error ? err.message : 'スキャンに失敗しました')
       setStep('select-drive')
     }
@@ -95,7 +134,11 @@ export function useRecovery() {
 
   const abortScan = useCallback(async () => {
     eventSourceRef.current?.close()
-    await fetch(`${API}/scan/abort`, { method: 'POST' })
+    await fetch(`${API}/scan/abort`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: sessionIdRef.current })
+    })
     setStep('select-drive')
   }, [])
 
@@ -122,11 +165,18 @@ export function useRecovery() {
     setStep('recovering')
     setRecoveryProgress(null)
 
-    // SSEで復元進捗を受信
-    const es = new EventSource(`${API}/recovery/progress`)
+    // SSEで復元進捗を受信（セッションID付き）
+    const sseUrl = sessionIdRef.current
+      ? `${API}/recovery/progress?sessionId=${sessionIdRef.current}`
+      : `${API}/recovery/progress`
+    const es = new EventSource(sseUrl)
     eventSourceRef.current = es
     es.onmessage = (event) => {
-      setRecoveryProgress(JSON.parse(event.data))
+      const data = JSON.parse(event.data)
+      setRecoveryProgress(data)
+      if (data.done) {
+        es.close()
+      }
     }
 
     try {
@@ -135,6 +185,7 @@ export function useRecovery() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          sessionId: sessionIdRef.current,
           files: filesToRecover,
           physicalDrive: selectedDrive.physicalDrive,
           outputDir
@@ -159,6 +210,13 @@ export function useRecovery() {
     }
   }, [selectedDrive, outputDir, selectedFiles, recoveredFiles])
 
+  const backToFiles = useCallback(() => {
+    setStep('file-list')
+    setRecoveryProgress(null)
+    setRecoveryResult(null)
+    setError(null)
+  }, [])
+
   const reset = useCallback(() => {
     setStep('select-drive')
     setSelectedDrive(null)
@@ -169,6 +227,7 @@ export function useRecovery() {
     setRecoveryProgress(null)
     setRecoveryResult(null)
     setError(null)
+    sessionIdRef.current = null
     refreshDrives()
   }, [refreshDrives])
 
@@ -197,6 +256,7 @@ export function useRecovery() {
     startScan,
     abortScan,
     startRecovery,
+    backToFiles,
     reset
   }
 }

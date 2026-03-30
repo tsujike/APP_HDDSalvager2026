@@ -7,8 +7,18 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - /output:/output
+      # 復元ファイルの出力先
+      - ./output:/output
+      # Linuxの場合、デバイスファイルへのアクセスが必要
+      - /dev:/dev:ro
+    # RAWディスクアクセスのため特権モードが必要
+    privileged: true
     restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    # コンテナ名
+    container_name: hdd-salvager-2026
 
   # ユニットテスト
   test:
@@ -16,3 +26,4 @@ services:
       context: .
       target: test
     profiles: [test]
+    container_name: hdd-salvager-2026-test

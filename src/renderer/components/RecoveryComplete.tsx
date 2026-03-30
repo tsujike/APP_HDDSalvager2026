@@ -4,9 +4,10 @@ interface Props {
     failed: { fileName: string; error: string }[]
   } | null
   onReset: () => void
+  onBackToFiles: () => void
 }
 
-export function RecoveryComplete({ result, onReset }: Props) {
+export function RecoveryComplete({ result, onReset, onBackToFiles }: Props) {
   if (!result) return null
 
   const { succeeded, failed } = result
@@ -76,8 +77,14 @@ export function RecoveryComplete({ result, onReset }: Props) {
       {/* アクションボタン */}
       <div className="flex gap-3">
         <button
-          onClick={onReset}
+          onClick={onBackToFiles}
           className="flex-1 py-3 rounded-lg font-medium text-sm bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+        >
+          ファイル一覧に戻る
+        </button>
+        <button
+          onClick={onReset}
+          className="flex-1 py-3 rounded-lg font-medium text-sm bg-gray-700 hover:bg-gray-600 text-white transition-colors"
         >
           最初からやり直す
         </button>

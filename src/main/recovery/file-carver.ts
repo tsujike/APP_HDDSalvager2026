@@ -1,11 +1,12 @@
-import type { FATBootSector, RecoveredFile, ScanProgress } from './types'
-import { readSectors } from './raw-disk'
+import type { FATBootSector, RecoveredFile, ScanProgress } from './types.js'
+import { readSectors } from './raw-disk.js'
 import {
   isMp4Signature,
   detectCodec,
   getCreationTime,
-  estimateFileSize
-} from './mp4-parser'
+  estimateFileSize,
+  estimateFileSizeWithMoov
+} from './mp4-parser.js'
 
 /**
  * ファイルカービングモジュール
@@ -14,8 +15,8 @@ import {
  * 検出してファイルを復元する。FAT復元で見つからないファイル向けのPhase 2。
  */
 
-/** スキャン時の読み取りチャンクサイズ (1MB) */
-const SCAN_CHUNK_SIZE = 1024 * 1024
+/** スキャン時の読み取りチャンクサイズ (32MB) — プロセス起動回数を削減 */
+const SCAN_CHUNK_SIZE = 32 * 1024 * 1024
 
 /** MP4ヘッダ読み取り最大サイズ (moovを含むために十分な量: 10MB) */
 const HEADER_READ_SIZE = 10 * 1024 * 1024
@@ -30,14 +31,14 @@ const HEADER_READ_SIZE = 10 * 1024 * 1024
  * @param onProgress 進捗コールバック
  * @param abortSignal 中断シグナル
  */
-export function carveFiles(
+export async function carveFiles(
   fd: number,
   boot: FATBootSector,
   afterDate: number,
   knownOffsets: Set<number>,
   onProgress?: (progress: ScanProgress) => void,
   abortSignal?: { aborted: boolean }
-): RecoveredFile[] {
+): Promise<RecoveredFile[]> {
   const results: RecoveredFile[] = []
   const totalBytes = boot.totalSectors * boot.bytesPerSector
   const dataStartByte = boot.dataStartSector * boot.bytesPerSector
@@ -69,14 +70,30 @@ export function carveFiles(
 
         // 既にFAT復元で検出済みならスキップ
         if (knownOffsets.has(absoluteOffset)) {
-          pos += 512 // 次のセクタ境界へ
+          pos += 512
           continue
         }
 
-        // MP4ヘッダを十分な量読み取る
-        const headerBuf = readHeaderSafe(fd, absoluteOffset, totalBytes)
+        // チャンク内の残りデータを可能な限り再利用し、不足分のみ追加読み取り
+        const remainingInChunk = chunk.length - pos
+        let headerBuf: Buffer | null
+        if (remainingInChunk >= HEADER_READ_SIZE) {
+          headerBuf = chunk.subarray(pos, pos + HEADER_READ_SIZE)
+        } else if (remainingInChunk >= 64) {
+          // チャンクの残り + 追加読み取りを結合
+          const extra = readHeaderSafe(fd, absoluteOffset + remainingInChunk, totalBytes,
+            HEADER_READ_SIZE - remainingInChunk)
+          if (extra) {
+            headerBuf = Buffer.concat([chunk.subarray(pos), extra])
+          } else {
+            headerBuf = chunk.subarray(pos)
+          }
+        } else {
+          headerBuf = readHeaderSafe(fd, absoluteOffset, totalBytes, HEADER_READ_SIZE)
+        }
+
         if (headerBuf) {
-          const file = parseCarvedFile(headerBuf, absoluteOffset, afterDate, boot)
+          const file = parseCarvedFile(headerBuf, absoluteOffset, afterDate, boot, fd, totalBytes)
           if (file) {
             filesFound++
             file.id = `carve-${filesFound}`
@@ -84,9 +101,12 @@ export function carveFiles(
           }
         }
 
-        // ftyp boxのサイズ分スキップ
+        // ftyp boxのサイズ分スキップ（妥当な範囲に制限）
         const ftypSize = chunk.readUInt32BE(pos)
-        pos += Math.max(ftypSize, 512)
+        const skip = (ftypSize >= 20 && ftypSize <= 1024 * 1024)
+          ? ftypSize
+          : 512
+        pos += Math.min(skip, chunk.length - pos)
         continue
       }
 
@@ -106,8 +126,11 @@ export function carveFiles(
       })
     }
 
-    // 次のチャンク（境界をまたぐケースのためにオーバーラップ）
-    offset += readSize - 512
+    // イベントループに制御を戻す（SSE進捗送信のため）
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // 次のチャンク（境界をまたぐケースのためにオーバーラップ、ただし最終チャンクは例外）
+    offset += readSize > 512 ? readSize - 512 : readSize
   }
 
   return results
@@ -119,9 +142,10 @@ export function carveFiles(
 function readHeaderSafe(
   fd: number,
   offset: number,
-  totalBytes: number
+  totalBytes: number,
+  maxSize: number = HEADER_READ_SIZE
 ): Buffer | null {
-  const readSize = Math.min(HEADER_READ_SIZE, totalBytes - offset)
+  const readSize = Math.min(maxSize, totalBytes - offset)
   if (readSize < 64) return null
   try {
     return readSectors(fd, offset, readSize)
@@ -137,7 +161,9 @@ function parseCarvedFile(
   buf: Buffer,
   diskOffset: number,
   afterDate: number,
-  boot: FATBootSector
+  boot: FATBootSector,
+  fd: number,
+  totalBytes: number
 ): RecoveredFile | null {
   // creation_time を取得
   const creationTime = getCreationTime(buf)
@@ -147,9 +173,28 @@ function parseCarvedFile(
     return null
   }
 
-  // ファイルサイズを推定
-  const fileSize = estimateFileSize(buf)
+  // ファイルサイズを推定（ftyp+mdat）
+  let fileSize = estimateFileSize(buf)
   if (fileSize < 1024) return null // 1KB未満は誤検出として除外
+
+  // moovをヘッダバッファ内（fast-start）またはmdat直後（通常配置）で探す
+  const hasMoovInHeader = getCreationTime(buf) !== null
+  const baseSizeBeforeMoov = fileSize
+
+  if (!hasMoovInHeader) {
+    // mdat直後のディスク位置を読んでmoovを探す（GoPro: moovがファイル末尾）
+    fileSize = estimateFileSizeWithMoov(fileSize, (probeOffset, probeLen) => {
+      const absOffset = diskOffset + probeOffset
+      if (absOffset + probeLen > totalBytes) return null
+      try {
+        return readSectors(fd, absOffset, probeLen)
+      } catch {
+        return null
+      }
+    })
+  }
+
+  const hasMoov = hasMoovInHeader || fileSize > baseSizeBeforeMoov
 
   // コーデック検出
   const codec = detectCodec(buf)
@@ -164,11 +209,12 @@ function parseCarvedFile(
     clusters.push(startCluster + i)
   }
 
-  // ファイル名を生成（タイムスタンプベース）
+  // ファイル名を生成
   const dateStr = creationTime
     ? formatDateForFileName(creationTime)
     : `offset_${diskOffset.toString(16)}`
-  const fileName = `RECOVERED_${dateStr}.MP4`
+  const moovTag = hasMoov ? '' : '_NO_MOOV'
+  const fileName = `RECOVERED_${dateStr}${moovTag}.MP4`
 
   return {
     id: '',
@@ -179,7 +225,8 @@ function parseCarvedFile(
     recoveryMethod: 'file-carving',
     diskOffset,
     clusters,
-    confidence: creationTime !== null ? 0.7 : 0.4
+    // moovなし → 再生不可能（0.1）、moovあり+日時あり → 0.8、moovあり+日時なし → 0.5
+    confidence: hasMoov ? (creationTime !== null ? 0.8 : 0.5) : 0.1
   }
 }
 

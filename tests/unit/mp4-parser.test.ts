@@ -185,5 +185,27 @@ describe('mp4-parser', () => {
       buf.writeUInt32BE(4, 16) // invalid size < 8
       expect(estimateFileSize(buf)).toBe(16)
     })
+
+    it('should return 0 for box exceeding 4GB limit', () => {
+      const buf = Buffer.alloc(24)
+      // 拡張サイズ (size=1 → 64bitサイズ使用)
+      buf.writeUInt32BE(1, 0)
+      buf.write('mdat', 4, 'ascii')
+      buf.writeBigUInt64BE(BigInt(5 * 1024 * 1024 * 1024), 8) // 5GB > 4GB上限
+      expect(estimateFileSize(buf)).toBe(0)
+    })
+
+    it('should return 0 when cumulative size exceeds 4GB', () => {
+      const buf = Buffer.alloc(24)
+      // box1: 3GB
+      buf.writeUInt32BE(3 * 1024 * 1024 * 1024, 0)
+      buf.write('ftyp', 4, 'ascii')
+      // box2: 2GB → 合計5GB > 4GB
+      buf.writeUInt32BE(2 * 1024 * 1024 * 1024, 8)
+      buf.write('mdat', 12, 'ascii')
+      // ftyp box size=3GBなのでbox2にはたどり着かないが、
+      // 3GB自体は4GB以下なので許可される
+      expect(estimateFileSize(buf)).toBe(3 * 1024 * 1024 * 1024)
+    })
   })
 })

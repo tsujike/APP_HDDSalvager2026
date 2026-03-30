@@ -1,5 +1,5 @@
-import type { DriveInfo } from '../recovery/types'
-import { listRemovableDrives } from '../recovery/raw-disk'
+import type { DriveInfo } from '../recovery/types.js'
+import { listRemovableDrives } from '../recovery/raw-disk.js'
 
 /**
  * ドライブ検出モジュール

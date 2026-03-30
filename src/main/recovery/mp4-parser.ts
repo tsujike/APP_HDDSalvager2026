@@ -118,6 +118,9 @@ export function getCreationTime(buf: Buffer): number | null {
   return unixSeconds * 1000
 }
 
+/** GoPro動画の現実的な最大サイズ: 4GB (FAT32上限) */
+const MAX_ESTIMATED_FILE_SIZE = 4 * 1024 * 1024 * 1024
+
 /**
  * MP4ファイルの推定サイズを取得する。
  * トップレベルboxのサイズを合算する。
@@ -142,14 +145,66 @@ export function estimateFileSize(buf: Buffer, startOffset: number = 0): number {
 
     if (boxSize < 8) break
 
+    // 個別boxまたは合計が上限を超えたら破損データとみなす
+    if (boxSize > MAX_ESTIMATED_FILE_SIZE || totalSize + boxSize > MAX_ESTIMATED_FILE_SIZE) {
+      return 0
+    }
+
     totalSize += boxSize
     offset += boxSize
 
-    // mdat の後は通常ファイル末尾
+    // mdat の後に moov が続くが、バッファ内では通常見えない
+    // → 呼び出し元で moov を追加探索する必要がある
     if (boxType === 'mdat') break
   }
 
   return totalSize
+}
+
+/**
+ * estimateFileSize の結果に moov box のサイズを加算する。
+ * GoPro MP4: [ftyp][mdat...大量...][moov] の構造で、moov がファイル末尾にある。
+ * estimateFileSize は ftyp+mdat までしか計算できないため、
+ * mdat直後のディスク位置を読んで moov を探す。
+ *
+ * @param baseSize estimateFileSize の戻り値 (ftyp+mdat)
+ * @param diskOffset ファイルのディスク上の開始オフセット
+ * @param probeRead mdat末尾から少量読み取る関数
+ * @returns moov を含んだ総ファイルサイズ
+ */
+export function estimateFileSizeWithMoov(
+  baseSize: number,
+  probeRead: (offset: number, length: number) => Buffer | null
+): number {
+  if (baseSize <= 0) return baseSize
+
+  // mdat 直後を読んで moov box を探す
+  const probe = probeRead(baseSize, 64)
+  if (!probe || probe.length < 8) return baseSize
+
+  const boxSize = probe.readUInt32BE(0)
+  const boxType = probe.toString('ascii', 4, 8)
+
+  if (boxType === 'moov' && boxSize >= 8 && boxSize <= MAX_ESTIMATED_FILE_SIZE) {
+    const total = baseSize + boxSize
+    if (total <= MAX_ESTIMATED_FILE_SIZE) return total
+  }
+
+  // moov 以外の box (e.g., free, skip) が挟まっている場合も探索
+  if (boxSize >= 8 && boxSize < 1024 * 1024) {
+    // 小さいboxをスキップしてもう一度探す
+    const probe2 = probeRead(baseSize + boxSize, 64)
+    if (probe2 && probe2.length >= 8) {
+      const boxSize2 = probe2.readUInt32BE(0)
+      const boxType2 = probe2.toString('ascii', 4, 8)
+      if (boxType2 === 'moov' && boxSize2 >= 8 && boxSize2 <= MAX_ESTIMATED_FILE_SIZE) {
+        const total = baseSize + boxSize + boxSize2
+        if (total <= MAX_ESTIMATED_FILE_SIZE) return total
+      }
+    }
+  }
+
+  return baseSize
 }
 
 /**

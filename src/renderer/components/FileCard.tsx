@@ -25,10 +25,11 @@ function formatDate(timestamp: number): string {
   })
 }
 
-function getConfidenceLabel(confidence: number): { text: string; color: string } {
-  if (confidence >= 0.8) return { text: '高', color: 'text-green-400' }
-  if (confidence >= 0.5) return { text: '中', color: 'text-yellow-400' }
-  return { text: '低', color: 'text-red-400' }
+function getConfidenceLabel(confidence: number): { text: string; color: string; detail: string } {
+  if (confidence >= 0.9) return { text: '高', color: 'text-green-400', detail: 'クラスタチェーン検証済み' }
+  if (confidence >= 0.6) return { text: '中', color: 'text-yellow-400', detail: '連続クラスタ仮定' }
+  if (confidence >= 0.3) return { text: '低', color: 'text-orange-400', detail: 'データ不完全の可能性' }
+  return { text: '破損', color: 'text-red-400', detail: '他データで上書きの可能性' }
 }
 
 export function FileCard({ file, isSelected, onToggle }: Props) {
@@ -94,7 +95,7 @@ export function FileCard({ file, isSelected, onToggle }: Props) {
         }`}>
           {file.recoveryMethod === 'fat-entry' ? 'FAT' : 'Carve'}
         </span>
-        <p className={`text-xs mt-1 ${conf.color}`}>
+        <p className={`text-xs mt-1 ${conf.color}`} title={conf.detail}>
           信頼度: {conf.text}
         </p>
       </div>

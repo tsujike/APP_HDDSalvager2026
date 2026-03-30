@@ -5,11 +5,11 @@ import type {
   RecoveryOptions,
   ScanProgress,
   FATBootSector
-} from './types'
-import { openDrive, closeDrive, readSectors } from './raw-disk'
-import { parseBootSector, scanDeletedEntries, rebuildClusterChain, clusterToOffset } from './fat-parser'
-import { getCreationTime, detectCodec } from './mp4-parser'
-import { carveFiles } from './file-carver'
+} from './types.js'
+import { openDrive, closeDrive, readSectors } from './raw-disk.js'
+import { parseBootSector, scanDeletedEntries, rebuildClusterChain, clusterToOffset, loadFATCache, releaseFATCache } from './fat-parser.js'
+import { getCreationTime, detectCodec } from './mp4-parser.js'
+import { carveFiles } from './file-carver.js'
 
 /**
  * リカバリーエンジン
@@ -38,7 +38,7 @@ export class RecoveryEngine {
       this.fd = openDrive(options.drive.physicalDrive)
       this.boot = parseBootSector(this.fd)
 
-      // === Phase 1: FAT削除エントリ復元 ===
+      // FATテーブルをメモリにキャッシュ（getNextCluster高速化の要）
       onProgress({
         phase: 'fat-scan',
         percent: 0,
@@ -46,14 +46,18 @@ export class RecoveryEngine {
         totalSectors: this.boot.totalSectors,
         filesFound: 0
       })
+      loadFATCache(this.fd, this.boot)
+      // イベントループに制御を戻す（SSE送信のため）
+      await new Promise(resolve => setTimeout(resolve, 0))
 
+      // === Phase 1: FAT削除エントリ復元 ===
       const deletedEntries = scanDeletedEntries(
         this.fd,
         this.boot,
         (scanned) => {
           onProgress({
             phase: 'fat-scan',
-            percent: Math.min(95, Math.floor(scanned / 10)),
+            percent: Math.min(40, Math.floor(scanned * 2)),
             currentSector: scanned,
             totalSectors: this.boot!.totalSectors,
             filesFound: allFiles.length
@@ -64,13 +68,26 @@ export class RecoveryEngine {
       // 削除エントリからRecoveredFileを構築
       const knownOffsets = new Set<number>()
       let fatFileCount = 0
+      const mp4Entries = deletedEntries.filter(e => e.extension.toUpperCase() === 'MP4')
 
-      for (const entry of deletedEntries) {
+      for (let ei = 0; ei < mp4Entries.length; ei++) {
+        const entry = mp4Entries[ei]
         if (this.abortSignal.aborted) break
-        if (entry.extension.toUpperCase() !== 'MP4') continue
 
-        // クラスタチェーンを再構築
-        const clusters = rebuildClusterChain(
+        // イベントループに制御を戻す
+        await new Promise(resolve => setTimeout(resolve, 0))
+
+        // 進捗報告（チェーン再構築フェーズ）
+        onProgress({
+          phase: 'fat-scan',
+          percent: 40 + Math.floor((ei / mp4Entries.length) * 55),
+          currentSector: 0,
+          totalSectors: this.boot.totalSectors,
+          filesFound: allFiles.length
+        })
+
+        // クラスタチェーンを再構築（FATキャッシュ利用で高速）
+        const chainResult = rebuildClusterChain(
           this.fd,
           entry.startCluster,
           entry.fileSize,
@@ -117,8 +134,8 @@ export class RecoveryEngine {
           codec,
           recoveryMethod: 'fat-entry',
           diskOffset,
-          clusters,
-          confidence: 0.9
+          clusters: chainResult.chain,
+          confidence: chainResult.confidence
         })
       }
 
@@ -132,7 +149,7 @@ export class RecoveryEngine {
 
       // === Phase 2: ファイルカービング ===
       if (options.enableCarving && !this.abortSignal.aborted) {
-        const carvedFiles = carveFiles(
+        const carvedFiles = await carveFiles(
           this.fd,
           this.boot,
           options.afterDate,
@@ -153,6 +170,7 @@ export class RecoveryEngine {
 
       return allFiles
     } finally {
+      releaseFATCache()
       if (this.fd !== null) {
         closeDrive(this.fd)
         this.fd = null
@@ -180,6 +198,7 @@ export class RecoveryEngine {
     let fd: number | null = null
     try {
       fd = openDrive(drive)
+      const boot = parseBootSector(fd)
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i]
@@ -192,8 +211,6 @@ export class RecoveryEngine {
           // クラスタからデータを読み取ってファイルに書き出し
           const writeStream = fs.createWriteStream(outputPath)
           let bytesWritten = 0
-
-          const boot = parseBootSector(fd)
 
           for (const cluster of file.clusters) {
             const offset = clusterToOffset(cluster, boot)
@@ -216,7 +233,18 @@ export class RecoveryEngine {
 
           succeeded.push(outputPath)
         } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err)
+          let message: string
+          if (err instanceof Error) {
+            // SystemErrorなどcode/syscallを持つ場合は詳細表示
+            const sysErr = err as Error & { code?: string; syscall?: string; path?: string }
+            if (sysErr.code) {
+              message = `${sysErr.code}: ${sysErr.message}${sysErr.path ? ` (${sysErr.path})` : ''}`
+            } else {
+              message = err.message
+            }
+          } else {
+            message = String(err)
+          }
           failed.push({ fileName: file.fileName, error: message })
         }
       }
